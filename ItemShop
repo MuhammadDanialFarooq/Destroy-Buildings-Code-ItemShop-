@@ -1,0 +1,939 @@
+--!strict
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+
+local Player = Players.LocalPlayer
+
+local Assets = ReplicatedFirst:WaitForChild("Assets")
+local BomberModels = Assets:WaitForChild("Bombers")
+
+local Modules = ReplicatedStorage:WaitForChild("Module")
+local Libraries = Modules:WaitForChild("Libraries")
+local UiModules = Modules:WaitForChild("Ui")
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+
+local BuyItem = Remotes:WaitForChild("BuyItem")
+
+local queueofBuy = {}
+
+local Marketplace = require(Modules:WaitForChild("MarketPlaceService"))
+local Notification = require(Modules:WaitForChild("Notifications"))
+local Abbriviate = require(Modules:WaitForChild("Abbriviate"))
+local UiManager = require(UiModules:WaitForChild("FrameHandler"))
+local RestockSystem = require(Modules:WaitForChild("RestockSystem"))
+
+local Bombers = require(Libraries:WaitForChild("Bombers"))
+local Breakables = require(Libraries:WaitForChild("Breakables"))
+
+local sfx = require(Modules.Sounds)
+
+local Map = workspace:WaitForChild("Map")
+local WorkspaceUiHitboxes = Map:WaitForChild("Triggers"):WaitForChild("Ui")
+
+local Template = script:WaitForChild("Template")
+
+local VIEWPORT_UPDATE_RATE = 1 / 24
+local ZONE_UPDATE_RATE = 0.1
+local TIMER_UPDATE_RATE = 0.25
+local VIEWPORT_ROTATION_SPEED = 1.5
+
+type ShopType = "Breakables" | "Bombers"
+
+type ShopItem = {
+	Frame: GuiObject,
+}
+
+type ViewportData = {
+	Model: Model | BasePart,
+	BaseCFrame: CFrame,
+	ShopType: ShopType,
+}
+
+local Stocks: {
+	[ShopType]: {[string]: any},
+} = {
+	Breakables = {},
+	Bombers = {},
+}
+
+local ShopItems: {
+	[ShopType]: {[string]: ShopItem},
+} = {
+	Breakables = {},
+	Bombers = {},
+}
+
+local ShopFrames: {[string]: ScrollingFrame} = {}
+local ShopHitboxes: {BasePart} = {}
+local ActiveViewportModels: {[WorldModel]: ViewportData} = {}
+local ProductPrices: {[number]: number} = {}
+
+local ShopBuilt: {[ShopType]: boolean} = {
+	Breakables = false,
+	Bombers = false,
+}
+
+local BuildQueues: {
+	[ShopType]: {{Id: string, Data: any}},
+} = {
+	Breakables = {},
+	Bombers = {},
+}
+
+local UiFetched = UiManager.GetUi("ItemShop")
+
+local ActiveShopType: ShopType? = nil
+local CurrentZone: BasePart? = nil
+
+local ViewportRotation = 0
+local ViewportAccumulator = 0
+local ZoneAccumulator = 0
+local TimerAccumulator = 0
+
+local function GetUi()
+	if UiFetched and UiFetched.Parent then
+		return UiFetched
+	end
+
+	UiFetched = UiManager.GetUi("ItemShop")
+
+	return UiFetched
+end
+
+local function GetShopData(ShopType: ShopType)
+	if ShopType == "Bombers" then
+		return Bombers
+	end
+
+	return Breakables
+end
+
+local function GetShopFrame(ShopType: ShopType): ScrollingFrame?
+	local Cached = ShopFrames[ShopType]
+
+	if Cached and Cached.Parent then
+		return Cached
+	end
+
+	local Ui = GetUi()
+
+	if not Ui then
+		return nil
+	end
+
+	local Frame = Ui.Items:FindFirstChild(ShopType)
+
+	if not Frame or not Frame:IsA("ScrollingFrame") then
+		return nil
+	end
+
+	ShopFrames[ShopType] = Frame
+
+	return Frame
+end
+
+local function FindExistingShopItem(
+	ShopType: ShopType,
+	ItemId: string
+): GuiObject?
+	local ParentFrame = GetShopFrame(ShopType)
+
+	if not ParentFrame then
+		return nil
+	end
+
+	local Existing = ParentFrame:FindFirstChild(ItemId)
+
+	if Existing and Existing:IsA("GuiObject") then
+		return Existing
+	end
+
+	return nil
+end
+
+local function GetRarityColor(Rarity: string): Color3
+	if Rarity == "Common" then
+		return Color3.fromRGB(255, 255, 255)
+	elseif Rarity == "UnCommon" then
+		return Color3.fromRGB(170, 255, 127)
+	elseif Rarity == "Rare" then
+		return Color3.fromRGB(170, 85, 255)
+	end
+
+	return Color3.fromRGB(255, 85, 85)
+end
+
+local function SetupViewport(
+	ViewportFrame: ViewportFrame,
+	ModelTemplate: Instance,
+	ShopType: ShopType
+)
+	local ExistingWorld = ViewportFrame:FindFirstChild("ViewportWorld")
+
+	if ExistingWorld then
+		if ExistingWorld:IsA("WorldModel") then
+			return
+		end
+
+		ExistingWorld:Destroy()
+	end
+
+	local WorldModel = Instance.new("WorldModel")
+	WorldModel.Name = "ViewportWorld"
+	WorldModel.Parent = ViewportFrame
+
+	local Camera = Instance.new("Camera")
+	Camera.Name = "ViewportCamera"
+	Camera.FieldOfView = 35
+	Camera.Parent = ViewportFrame
+
+	ViewportFrame.CurrentCamera = Camera
+
+	local Model = ModelTemplate:Clone()
+	Model.Parent = WorldModel
+
+	local ModelSize: Vector3
+
+	if Model:IsA("Model") then
+		Model:PivotTo(CFrame.new())
+
+		local _, Size = Model:GetBoundingBox()
+		ModelSize = Size
+	elseif Model:IsA("BasePart") then
+		Model.CFrame = CFrame.new()
+		ModelSize = Model.Size
+	else
+		WorldModel:Destroy()
+		Camera:Destroy()
+		return
+	end
+
+	local LargestSize = math.max(
+		ModelSize.X,
+		ModelSize.Y,
+		ModelSize.Z
+	)
+
+	local Distance =
+		(LargestSize * 0.5)
+		/ math.tan(math.rad(Camera.FieldOfView * 0.5))
+
+	Distance *= 1.3
+
+	Camera.CFrame = CFrame.lookAt(
+		Vector3.new(
+			LargestSize * 0.35,
+			LargestSize * 0.15,
+			Distance
+		),
+		Vector3.zero
+	)
+
+	local Data: ViewportData = {
+		Model = Model,
+		BaseCFrame = if Model:IsA("Model")
+			then Model:GetPivot()
+			else Model.CFrame,
+		ShopType = ShopType,
+	}
+	ViewportFrame.LightDirection = Data.BaseCFrame.Position
+	
+
+	ActiveViewportModels[WorldModel] = Data
+
+	WorldModel.Destroying:Once(function()
+		ActiveViewportModels[WorldModel] = nil
+	end)
+end
+
+local function UpdateStockText(
+	ShopType: ShopType,
+	ItemId: string
+)
+	local Item = ShopItems[ShopType][ItemId]
+
+	if not Item or not Item.Frame.Parent then
+		return
+	end
+
+	local StockData = Stocks[ShopType][ItemId]
+
+	local StockText = Item.Frame:FindFirstChild("Stock")
+
+	if not StockText or not StockText:IsA("TextLabel") then
+		return
+	end
+
+	if StockData then
+		StockText.Text = StockData.Stock .. "x Stock"
+		Item.Frame.BackgroundColor3 = if StockData.Stock > 0
+			then Color3.fromRGB(85, 170, 255)
+			else Color3.fromRGB(75, 75, 75)
+	else
+		StockText.Text = "Stock: 0x"
+		Item.Frame.BackgroundColor3 = Color3.fromRGB(75, 75, 75)
+	end
+end
+
+local function UpdateAllStockText(ShopType: ShopType)
+	for ItemId in ShopItems[ShopType] do
+		UpdateStockText(ShopType, ItemId)
+	end
+end
+
+local function RefreshStocks(ShopType: ShopType)
+	local AllStocks = RestockSystem:GetStock()
+
+	if AllStocks and AllStocks[ShopType] then
+		Stocks[ShopType] = AllStocks[ShopType]
+	end
+
+	UpdateAllStockText(ShopType)
+end
+
+local function CreateShopItem(
+	ItemId: string,
+	ItemData: any,
+	ShopType: ShopType
+)
+	local Cached = ShopItems[ShopType][ItemId]
+
+	if Cached then
+		if Cached.Frame.Parent then
+			return
+		end
+
+		ShopItems[ShopType][ItemId] = nil
+	end
+
+	local Existing = FindExistingShopItem(ShopType, ItemId)
+
+	if Existing then
+		ShopItems[ShopType][ItemId] = {
+			Frame = Existing,
+		}
+
+		return
+	end
+
+	local ParentFrame = GetShopFrame(ShopType)
+
+	if not ParentFrame then
+		return
+	end
+
+	local New = Template:Clone()
+
+	New.Name = ItemId
+	New.LayoutOrder = ItemData.Price
+
+	local ViewportFrame = New:FindFirstChild("ViewportFrame")
+	local Buttons = New:FindFirstChild("Buttons")
+	local InfoProd = New:FindFirstChild("InfoProd")
+
+	if not ViewportFrame
+		or not ViewportFrame:IsA("ViewportFrame")
+		or not Buttons
+		or not InfoProd
+	then
+		New:Destroy()
+		return
+	end
+
+	local TitleUp = ViewportFrame:FindFirstChild("TitleUp")
+	local TitleDown = ViewportFrame:FindFirstChild("TitleDown")
+
+	if TitleUp and TitleUp:IsA("TextLabel") then
+		TitleUp.Text = ItemData.Name
+	end
+
+	if TitleDown and TitleDown:IsA("TextLabel") then
+		TitleDown.Text = ItemData.Name
+	end
+
+	local Buy = Buttons:FindFirstChild("Buy")
+	local BuyWRobux = Buttons:FindFirstChild("BuyWRobux")
+
+	if Buy then
+		local Main = Buy:FindFirstChild("Main")
+
+		if Main then
+			local TextLabel = Main:FindFirstChild("TextLabel")
+
+			if TextLabel and TextLabel:IsA("TextLabel") then
+				TextLabel.Text = "$" .. Abbriviate.Number(ItemData.Price)
+			end
+		end
+	end
+
+	if BuyWRobux then
+		local Main = BuyWRobux:FindFirstChild("Main")
+
+		if Main then
+			local Title = Main:FindFirstChild("Title")
+
+			if Title and Title:IsA("TextLabel") then
+				local CachedPrice = ProductPrices[ItemData.ProductId]
+
+				if CachedPrice then
+					Title.Text = "" .. CachedPrice
+				else
+					Title.Text = "??"
+
+					local ProductInfo = Marketplace:GetDataAboutProduct(
+						ItemData.ProductId,
+						Enum.InfoType.Product
+					)
+
+					if ProductInfo and ProductInfo.PriceInRobux then
+						ProductPrices[ItemData.ProductId] =
+							ProductInfo.PriceInRobux
+
+						Title.Text =
+							"" .. ProductInfo.PriceInRobux
+					end
+				end
+			end
+		end
+	end
+
+	local Stock = New:FindFirstChild("Stock")
+
+	if Stock and Stock:IsA("TextLabel") then
+		local StockData = Stocks[ShopType][ItemId]
+
+		if StockData then
+			Stock.Text = StockData.Stock .. "x Stock"
+			New.BackgroundColor3 = if StockData.Stock > 0
+				then Color3.fromRGB(85, 170, 255)
+				else Color3.fromRGB(75, 75, 75)
+		else
+			Stock.Text = "Stock: 0x"
+			New.BackgroundColor3 = Color3.fromRGB(75, 75, 75)
+		end
+	end
+
+	local TimeToLoad = InfoProd:FindFirstChild("TimeToLoad")
+	local Stat = InfoProd:FindFirstChild("Stat")
+
+	if TimeToLoad then
+		local TextLabel = TimeToLoad:FindFirstChild("TextLabel")
+
+		if TextLabel and TextLabel:IsA("TextLabel") then
+			TextLabel.Text =
+				if ItemData.RespawnTime
+				then Abbriviate.time(ItemData.RespawnTime) --.. "x/sec"
+				elseif ItemData.Damage
+				then Abbriviate.Number(ItemData.Damage)
+				else ""
+			
+			
+		end
+		local IconTime = TimeToLoad:FindFirstChild("IconTime")
+		
+		if IconTime and IconTime:IsA("ImageLabel") then
+			IconTime.Image = if ItemData.RespawnTime
+				then "rbxassetid://130552157615944"
+				elseif ItemData.Damage
+				then "rbxassetid://80806072965963"
+				else ""
+
+		end
+	end
+
+	if Stat then
+		local TextLabel = Stat:FindFirstChild("TextLabel")
+
+		if TextLabel and TextLabel:IsA("TextLabel") then
+			TextLabel.Text =
+				if ItemData.Scrap
+				then Abbriviate.Number(tostring(ItemData.Scrap))
+				elseif ItemData.ScrapLimit
+				then Abbriviate.Number(tostring(ItemData.ScrapLimit))
+				else ""
+		end
+		
+		local IconTime = Stat:FindFirstChild("IconTime")
+
+		if IconTime and IconTime:IsA("ImageLabel") then
+			IconTime.Image = if ItemData.Scrap
+				then "rbxassetid://122019073585267"
+				elseif ItemData.ScrapLimit
+				then "rbxassetid://96091274813329"
+				else ""
+
+		end
+	end
+
+	New.Parent = ParentFrame
+
+	ShopItems[ShopType][ItemId] = {
+		Frame = New,
+	}
+	
+	if ItemData.ImageId then
+		local Icon = ViewportFrame:FindFirstChild("Icon")
+
+		if Icon and (Icon:IsA("ImageLabel") or Icon:IsA("ImageButton")) then
+			local ImageId = tostring(ItemData.ImageId)
+
+			if not ImageId:find("rbxassetid://", 1, true) then
+				ImageId = "rbxassetid://" .. ImageId
+			end
+
+			Icon.Image = ImageId
+			Icon.Visible = true
+		end
+	else
+		local ModelTemplate = BomberModels:FindFirstChild(ItemId)
+
+		if ModelTemplate then
+			SetupViewport(ViewportFrame, ModelTemplate, ShopType)
+		end
+	end
+	
+
+	if Buy and Buy:IsA("GuiButton") then
+		Buy.MouseButton1Click:Connect(function()
+			if not RestockSystem:CheckStock(ShopType, ItemId) then
+				Notification.Notification(
+					"Error",
+					ItemData.Name .. " has no stock!"
+				)
+
+				return
+			end
+			if queueofBuy and queueofBuy[ItemId] then
+				return
+			end
+			queueofBuy[ItemId] = true
+
+			local State = BuyItem:InvokeServer(
+				ItemId,
+				ShopType
+			)
+
+			if ShopType == "Bombers" then
+				if State and State ~= "Stock" then
+					
+
+					sfx.PlayCloneSFX("Chaching")
+					Notification.Notification(
+						"Success",
+						ItemData.Name .. " Bought!"
+					)
+
+					RestockSystem:DecreaseStock(
+						ShopType,
+						ItemId,
+						1
+					)
+
+					RefreshStocks(ShopType)
+
+				elseif State == "Stock" then
+					Notification.Notification(
+						"Error",
+						ItemData.Name .. " has no stock!"
+					)
+				else
+					Notification.Notification(
+						"Error",
+						"Not Enough Cash!"
+					)
+				end
+			elseif State then
+				Notification.Notification(
+					"Success",
+					ItemData.Name .. " Bought!"
+				)
+				sfx.PlayCloneSFX("Chaching")
+
+				RestockSystem:DecreaseStock(
+					ShopType,
+					ItemId,
+					1
+				)
+
+				RefreshStocks(ShopType)
+			else
+				Notification.Notification(
+					"Error",
+					"Unable to buy " .. ItemData.Name
+				)
+			end
+
+			queueofBuy[ItemId] = nil
+			
+		end)
+	end
+
+	if BuyWRobux and BuyWRobux:IsA("GuiButton") then
+		BuyWRobux.MouseButton1Click:Connect(function()
+			BuyItem:InvokeServer(
+				ItemId,
+				ShopType,
+				true
+			)
+		end)
+	end
+
+	New.Destroying:Once(function()
+		local Current = ShopItems[ShopType][ItemId]
+
+		if Current and Current.Frame == New then
+			ShopItems[ShopType][ItemId] = nil
+		end
+	end)
+end
+
+local function QueueShopBuild(ShopType: ShopType)
+	if ShopBuilt[ShopType] then
+		return
+	end
+
+	if #BuildQueues[ShopType] > 0 then
+		return
+	end
+
+	local Items = GetShopData(ShopType)
+	local Queue = BuildQueues[ShopType]
+
+	for ItemId, ItemData in Items do
+		if not ShopItems[ShopType][ItemId]
+			and not FindExistingShopItem(ShopType, ItemId)
+		then
+			table.insert(Queue, {
+				Id = ItemId,
+				Data = ItemData,
+			})
+		end
+	end
+
+	table.sort(Queue, function(A, B)
+		return A.Data.Price < B.Data.Price
+	end)
+
+	if #Queue == 0 then
+		ShopBuilt[ShopType] = true
+	end
+end
+
+local function ProcessBuildQueue()
+	if not ActiveShopType then
+		return
+	end
+
+	local Queue = BuildQueues[ActiveShopType]
+
+	if #Queue == 0 then
+		if not ShopBuilt[ActiveShopType] then
+			ShopBuilt[ActiveShopType] = true
+		end
+
+		return
+	end
+
+	local Entry = table.remove(Queue, 1)
+
+	if Entry then
+		CreateShopItem(
+			Entry.Id,
+			Entry.Data,
+			ActiveShopType
+		)
+	end
+
+	if #Queue == 0 then
+		ShopBuilt[ActiveShopType] = true
+	end
+end
+
+local function SetVisibleShop(ShopType: ShopType)
+	local Ui = GetUi()
+
+	if not Ui then
+		return
+	end
+
+	for _, Frame in Ui.Items:GetChildren() do
+		if Frame:IsA("ScrollingFrame") then
+			ShopFrames[Frame.Name] = Frame
+			Frame.Visible = Frame.Name == ShopType
+		end
+	end
+end
+
+local function OpenShop(ShopType: ShopType)
+	local Ui = GetUi()
+
+	if not Ui then
+		return
+	end
+
+	ActiveShopType = ShopType
+
+	local DisplayName =
+		if ShopType == "Breakables"
+		then "Buildings"
+		else ShopType
+
+	Ui.Tag.Text.Amount.Text =
+		DisplayName .. " Shop"
+
+	Ui.Tag.Text.Amount2.Text =
+		DisplayName .. " Shop"
+
+	SetVisibleShop(ShopType)
+	RefreshStocks(ShopType)
+	QueueShopBuild(ShopType)
+
+	UiManager.Open(
+		"ItemShop",
+		nil
+	)
+	sfx.PlayCloneSFX("ItemShopOpen")
+end
+
+local function CloseShop()
+	if not ActiveShopType then
+		return
+	end
+
+	ActiveShopType = nil
+
+	UiManager.Close("ItemShop")
+end
+
+local function PointInsidePart(
+	Part: BasePart,
+	Position: Vector3
+): boolean
+	local LocalPosition =
+		Part.CFrame:PointToObjectSpace(Position)
+
+	local HalfSize = Part.Size * 0.5
+
+	return
+		math.abs(LocalPosition.X) <= HalfSize.X
+		and math.abs(LocalPosition.Y) <= HalfSize.Y
+		and math.abs(LocalPosition.Z) <= HalfSize.Z
+end
+
+local function UpdateZones()
+	local Character = Player.Character
+
+	if not Character then
+		return
+	end
+
+	local Root = Character:FindFirstChild("HumanoidRootPart")
+
+	if not Root or not Root:IsA("BasePart") then
+		return
+	end
+
+	local FoundZone: BasePart? = nil
+
+	for _, Hitbox in ShopHitboxes do
+		if Hitbox.Parent
+			and PointInsidePart(Hitbox, Root.Position)
+		then
+			FoundZone = Hitbox
+			break
+		end
+	end
+
+	if FoundZone == CurrentZone then
+		return
+	end
+
+	CurrentZone = FoundZone
+
+	if not FoundZone then
+		CloseShop()
+		return
+	end
+
+	local ShopType = FoundZone:GetAttribute("FrameType")
+
+	if ShopType ~= "Breakables"
+		and ShopType ~= "Bombers"
+	then
+		CloseShop()
+		return
+	end
+
+	local TypedShopType = ShopType :: ShopType
+
+	if ActiveShopType ~= TypedShopType then
+		OpenShop(TypedShopType)
+	end
+end
+
+local function UpdateRestockTimer()
+	local Ui = GetUi()
+
+	if not Ui then
+		return
+	end
+
+	local TimeLeft = RestockSystem:GetTimeRemaining()
+
+	if TimeLeft <= 0 then
+
+		return
+	end
+
+	Ui.Info.Info.RestockTimer.Text =
+		Abbriviate.time(TimeLeft)
+	
+	if ActiveShopType then 
+		RefreshStocks(ActiveShopType)
+	end
+end
+
+local function UpdateViewports(DeltaTime: number)
+	if not ActiveShopType then
+		return
+	end
+
+	ViewportRotation +=
+		DeltaTime * VIEWPORT_ROTATION_SPEED
+
+	if ViewportRotation >= math.pi * 2 then
+		ViewportRotation -= math.pi * 2
+	end
+
+	local Rotation = CFrame.Angles(
+		0,
+		ViewportRotation,
+		0
+	)
+
+	for WorldModel, Data in ActiveViewportModels do
+		if not WorldModel.Parent then
+			ActiveViewportModels[WorldModel] = nil
+			continue
+		end
+
+		if Data.ShopType ~= ActiveShopType then
+			continue
+		end
+
+		local Model = Data.Model
+
+		if Model:IsA("Model") then
+			Model:PivotTo(
+				Data.BaseCFrame * Rotation
+			)
+		else
+			Model.CFrame =
+				Data.BaseCFrame * Rotation
+		end
+		
+	end
+end
+
+local function SetupShopHitboxes()
+	for _, Hitbox in WorkspaceUiHitboxes:GetChildren() do
+		if Hitbox.Name == "ItemShop"
+			and Hitbox:IsA("BasePart")
+		then
+			table.insert(
+				ShopHitboxes,
+				Hitbox
+			)
+		end
+	end
+end
+
+local function SetupShopFrames()
+	local Ui = GetUi()
+
+	if not Ui then
+		return
+	end
+
+	for _, Child in Ui.Items:GetChildren() do
+		if Child:IsA("ScrollingFrame") then
+			ShopFrames[Child.Name] = Child
+		end
+	end
+end
+
+local function SetupRestockButton()
+	local Ui = GetUi()
+
+	if not Ui then
+		repeat
+			Ui = GetUi()
+			task.wait()
+		until Ui
+		
+	end
+
+	local RestockButton =
+		Ui:FindFirstChild("Restock")
+
+	if not RestockButton
+		or not RestockButton:IsA("GuiButton")
+	then
+		warn("Restock button not found in UI")
+		return
+	end
+
+	RestockButton.MouseButton1Click:Connect(function()
+		if ActiveShopType then
+			BuyItem:InvokeServer(
+				"Restock" .. ActiveShopType
+			)
+		end
+	end)
+end
+
+SetupShopHitboxes()
+SetupShopFrames()
+SetupRestockButton()
+
+RestockSystem.init()
+
+
+
+workspace:GetAttributeChangedSignal("RestockSeed"):Connect(function()
+	if ActiveShopType then
+		RefreshStocks(ActiveShopType)
+	end
+end)
+
+RunService.Heartbeat:Connect(function(DeltaTime)
+	ProcessBuildQueue()
+
+	ZoneAccumulator += DeltaTime
+	TimerAccumulator += DeltaTime
+	ViewportAccumulator += DeltaTime
+
+	if ZoneAccumulator >= ZONE_UPDATE_RATE then
+		ZoneAccumulator -= ZONE_UPDATE_RATE
+		UpdateZones()
+	end
+
+	if TimerAccumulator >= TIMER_UPDATE_RATE then
+		TimerAccumulator -= TIMER_UPDATE_RATE
+
+		if ActiveShopType then
+			UpdateRestockTimer()
+		end
+	end
+
+	if ViewportAccumulator >= VIEWPORT_UPDATE_RATE then
+		local Elapsed = ViewportAccumulator
+		ViewportAccumulator = 0
+
+		UpdateViewports(Elapsed)
+	end
+end)
+
